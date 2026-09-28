@@ -1,0 +1,66 @@
+# Публикуется ТОЛЬКО исходный код. Правило простое: сначала закрыто всё, ниже
+# перечислено то, что попадает в репозиторий. Так новый файл с данными или ключом
+# не утечёт «заодно» — его придётся разрешить руками.
+#
+# Данные (база, обучающие выборки, веса моделей, отчёты) не публикуются: они весят
+# десятки гигабайт и раздаются отдельно, программа скачивает их из каталога
+# (вкладка «Каталог», см. code/assets.py).
+
+/*
+
+!/.gitignore
+!/README.md
+!/Readme.md
+!/requirements.txt
+!/*.py
+!/ComplexPrediction/
+!/Regions_rabbits/
+
+# --- первая версия (курсовой проект): только скрипты ---
+ComplexPrediction/*
+!ComplexPrediction/*.py
+
+# --- нынешняя программа ---
+Regions_rabbits/*
+!Regions_rabbits/code/
+!Regions_rabbits/docs/
+!Regions_rabbits/installer/
+!Regions_rabbits/logos/
+!Regions_rabbits/make_exe.py
+!Regions_rabbits/smoke_hook.py
+!Regions_rabbits/nerual_rabbit.spec
+!Regions_rabbits/run_app.bat
+!Regions_rabbits/requirements.txt
+
+Regions_rabbits/code/*
+!Regions_rabbits/code/*.py
+!Regions_rabbits/code/*.md
+!Regions_rabbits/code/requirements.txt
+
+Regions_rabbits/docs/*
+!Regions_rabbits/docs/*.md
+
+Regions_rabbits/logos/*
+!Regions_rabbits/logos/*.ico
+!Regions_rabbits/logos/*.png
+
+Regions_rabbits/installer/*
+!Regions_rabbits/installer/*.iss
+
+# --- запрет поверх разрешений: секреты и личные данные никогда ---
+# (дублирует правила выше на случай, если что-то разрешат новым шаблоном)
+**/ukey.txt
+**/ukeys.csv
+**/accounts.csv
+**/Your_key.xlx
+**/Your_key.xlsx
+**/workspace/
+**/avatars/
+
+# --- служебное ---
+__pycache__/
+*.py[cod]
+.idea/
+.claude/
+.venv/
+venv/
