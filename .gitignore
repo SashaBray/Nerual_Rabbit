@@ -39,6 +39,8 @@ Regions_rabbits/code/*
 
 Regions_rabbits/docs/*
 !Regions_rabbits/docs/*.md
+!Regions_rabbits/docs/*/
+!Regions_rabbits/docs/**/*.md
 
 Regions_rabbits/logos/*
 !Regions_rabbits/logos/*.ico
