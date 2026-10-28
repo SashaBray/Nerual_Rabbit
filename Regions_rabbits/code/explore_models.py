@@ -142,6 +142,40 @@ def split_indices(n, seed):
     return train, test, val
 
 
+FOLD = None          # задаётся при SPLIT_MODE='folds': см. folds.py и split_by_fold
+
+
+def split_by_fold(ids, fold, seed):
+    """Разбиение по заданному фолду: обучение/валидация/тест выбираются ГОДОМ.
+
+    ``fold`` = {'train_years': [...], 'val_year': Y-1, 'test_year': Y, 'pairs': set|None}.
+    ``pairs`` — общая выборка пар «район, год» (пересечение заданий): с ней 12-канальная и
+    23-канальная сети меряются на одних и тех же районах и годах. Порядок внутри частей
+    перемешивается seed-ом, само разбиение от seed не зависит.
+    """
+    tid = (ids['id_region'].astype(int).astype(str) + '_'
+           + ids['id_district'].astype(int).astype(str)).to_numpy()
+    years = ids['year'].to_numpy(dtype=int)
+    allowed = np.ones(len(years), dtype=bool)
+    if fold.get('pairs'):
+        pairs = fold['pairs']
+        allowed = np.array([(t, int(y)) in pairs for t, y in zip(tid, years)])
+    rng = np.random.default_rng(seed)
+    if fold.get('test_pairs') is not None:         # роли заданы парами (лесенка утечек)
+        pick = lambda pp: rng.permutation(
+            np.where(np.array([(t, int(y)) in pp for t, y in zip(tid, years)]))[0])
+        tr, va, te = pick(fold['train_pairs']), pick(fold['val_pairs']), pick(fold['test_pairs'])
+    else:
+        pick_mask = lambda m: rng.permutation(np.where(allowed & m)[0])
+        tr = pick_mask(np.isin(years, list(fold['train_years'])))
+        va = pick_mask(years == int(fold['val_year']))
+        te = pick_mask(years == int(fold['test_year']))
+    for part, name in ((tr, 'обучение'), (va, 'валидация'), (te, 'тест')):
+        if len(part) == 0:
+            raise SystemExit(f'Фолд {fold.get("fold")}: часть «{name}» пуста — проверьте годы и выборку')
+    return tr, te, va
+
+
 def split_by_year(years, seed):
     """Leave-one-year-out: test = последний год, val = предпоследний, train = ранние.
 
@@ -372,7 +406,12 @@ def prepare_data(task, seed):
     Xb, y, prod_hist, ids, n_corrupt = drop_corrupt(Xb, y, prod_hist, ids)
     n = Xb.shape[0]
     split_years = None
-    if SPLIT_MODE == 'year':
+    if SPLIT_MODE == 'folds':
+        if not FOLD:
+            raise SystemExit('SPLIT_MODE=folds, но фолд не задан (explore_models.FOLD)')
+        tr, te, va = split_by_fold(ids, FOLD, seed)
+        split_years = (int(min(FOLD['train_years'])), int(FOLD['val_year']), int(FOLD['test_year']))
+    elif SPLIT_MODE == 'year':
         tr, te, va, split_years = split_by_year(ids['year'].values, seed)
     else:
         tr, te, va = split_indices(n, seed)

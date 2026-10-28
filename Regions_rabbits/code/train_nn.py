@@ -175,8 +175,58 @@ def build_mse24(in_channels, in_length):
     return model, summary, n_params, cfg
 
 
+def build_compact(in_channels, in_length, per_channel=False, width=(32, 48, 64), head=64):
+    """Свёртки выбирают признаки, голова только складывает их в число.
+
+    Зачем. У ``mse24`` и ``cnn`` пропорция обратная: маленький экстрактор и огромная
+    полносвязная голова (7.5 млн и 0.9 млн весов соответственно). Вдобавок ``mse24`` делает
+    ``Flatten`` по времени, то есть видит «что было в такой-то день» и может запомнить ход
+    конкретного года.
+
+    Здесь ряд сжимается свёртками с пулингом, затем усредняется по времени
+    (``AdaptiveAvgPool1d``): остаётся по паре чисел на свёрточный канал — «каким был сезон»
+    без привязки к дням. Голова — один скрытый слой. Всего порядка 40–70 тысяч весов.
+
+    ``per_channel=True`` — первый слой раздельный по входным каналам (``groups``): каждый
+    параметр ряда сначала описывается сам по себе, и только потом они смешиваются. Это та же
+    мысль, что и в ансамбле одноканальных моделей, только обученная совместно.
+    """
+    c1, c2, c3 = width
+    g = in_channels if per_channel else 1
+    c1 = (c1 // in_channels) * in_channels if per_channel else c1       # кратно числу каналов
+    c1 = max(c1, in_channels)
+    conv = nn.Sequential(
+        nn.Conv1d(in_channels, c1, kernel_size=9, padding=4, groups=g), nn.BatchNorm1d(c1),
+        nn.ReLU(inplace=True), nn.MaxPool1d(4),
+        nn.Conv1d(c1, c2, kernel_size=7, padding=3), nn.BatchNorm1d(c2),
+        nn.ReLU(inplace=True), nn.MaxPool1d(4),
+        nn.Conv1d(c2, c3, kernel_size=5, padding=2), nn.BatchNorm1d(c3),
+        nn.ReLU(inplace=True),
+        nn.AdaptiveAvgPool1d(2),                     # «каким был сезон», без привязки ко дню
+    )
+    net = nn.Sequential(conv, nn.Flatten(), nn.Dropout(0.3),
+                        nn.Linear(c3 * 2, head), nn.ReLU(inplace=True), nn.Dropout(0.2),
+                        nn.Linear(head, 1))
+    model = SqueezeHead(net)
+    n_params = sum(p.numel() for p in model.parameters())
+    summary = ('Компактная свёрточная сеть (свёртки выбирают признаки, голова маленькая):\n'
+               f'  Conv1d({in_channels}->{c1}, k=9{", раздельно по каналам" if per_channel else ""})'
+               f' -> BN -> ReLU -> MaxPool(4)\n'
+               f'  Conv1d({c1}->{c2}, k=7) -> BN -> ReLU -> MaxPool(4)\n'
+               f'  Conv1d({c2}->{c3}, k=5) -> BN -> ReLU -> AdaptiveAvgPool1d(2)\n'
+               f'  Dropout(0.3) -> Linear({c3 * 2}->{head}) -> ReLU -> Dropout(0.2) -> {head}->1\n'
+               f'  Параметров: {n_params:,}')
+    cfg = {'style': 'compact', 'conv_channels': [c1, c2, c3], 'per_channel': per_channel,
+           'head': head, 'pool': 'avg2', 'batchnorm': True, 'activation': 'relu'}
+    return model, summary, n_params, cfg
+
+
 def make_model(arch, in_channels, in_length):
     """Вернуть (model, summary_text, n_params, cfg) по имени архитектуры."""
+    if arch == 'compact':
+        return build_compact(in_channels, in_length)
+    if arch == 'compact_pc':            # то же, но первый слой раздельный по входным каналам
+        return build_compact(in_channels, in_length, per_channel=True)
     if arch in ('mse24', 'conv'):       # 'conv' — псевдоним: «свёрточная модель» (свёрточные слои + ELU)
         return build_mse24(in_channels, in_length)
     model = CNNRegressor(in_channels, in_length, ARCH)
@@ -347,10 +397,16 @@ def _next_version(group):
 # Главный сценарий
 # --------------------------------------------------------------------------- #
 def run(task, name, epochs, batch, lr, patience, seed, arch='cnn', augment=False, aug_step=7,
-        split_mode='random', aug_scope='full'):
+        split_mode='random', aug_scope='full', fold_scheme=None, fold_year=None):
     torch.manual_seed(seed)
     np.random.seed(seed)
-    E.SPLIT_MODE = split_mode               # 'random' или 'year' (leave-one-year-out)
+    E.SPLIT_MODE = split_mode               # 'random', 'year' (leave-one-year-out) или 'folds'
+    fold_info = None
+    if split_mode == 'folds':               # общее разбиение по годам, см. code/folds.py
+        import folds as FD
+        scheme = FD.read_definition(fold_scheme)
+        fold_info = FD.fold_spec(scheme, int(fold_year))
+        E.FOLD = fold_info
     group = name or f'{task}_nn'           # имя = датасет + _nn, без атрибутов
     ver = _next_version(group)             # каждый прогон — НОВАЯ версия vN (не перезаписываем)
     tag = f'v{ver}'
@@ -437,6 +493,8 @@ def run(task, name, epochs, batch, lr, patience, seed, arch='cnn', augment=False
         'in_channels': in_channels, 'in_length': in_length,
         'split': split, 'seed': seed, 'yield_max': E.YIELD_MAX,
         'split_mode': split_mode, 'split_years': P.get('split_years'),
+        'fold_scheme': fold_scheme, 'fold_year': fold_year,
+        'fold_pairs': len(fold_info['pairs']) if fold_info and fold_info.get('pairs') else None,
         'aug_scope': aug_scope if augment else None,
         'epochs_run': len(history), 'best_epoch': best_epoch, 'best_val_mse': best_mse,
         'optimizer': 'Adam', 'lr': lr, 'batch': batch, 'patience': patience, 'loss': 'MSE',
@@ -471,11 +529,15 @@ if __name__ == '__main__':
     ap.add_argument('--augment', action='store_true',
                     help='аугментация заблаговременности: примеры с отсечкой (будущее->климатология)')
     ap.add_argument('--aug-step', type=int, default=7, help='шаг отсечки при аугментации, дней')
-    ap.add_argument('--split', default='random', choices=['random', 'year'],
+    ap.add_argument('--fold-scheme', default=None,
+                    help='имя схемы фолдов из workspace/tasks/folds (например winter_wheat)')
+    ap.add_argument('--fold-year', type=int, default=None, help='тестовый год фолда')
+    ap.add_argument('--split', default='random', choices=['random', 'year', 'folds'],
                     help='random=70/15/15 по примерам; year=leave-one-year-out '
                          '(test=последний год, val=предпоследний, train=ранние)')
     ap.add_argument('--aug-scope', default='full', choices=['full', 'year'],
                     help='full=отсечки по всему ряду; year=только в целевом году (честно, без утечки t-1)')
     a = ap.parse_args()
     run(a.task, a.name, a.epochs, a.batch, a.lr, a.patience, a.seed, a.arch, a.augment, a.aug_step,
-        split_mode=a.split, aug_scope=a.aug_scope)
+        split_mode=a.split, aug_scope=a.aug_scope,
+        fold_scheme=a.fold_scheme, fold_year=a.fold_year)
