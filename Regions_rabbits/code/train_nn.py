@@ -221,8 +221,76 @@ def build_compact(in_channels, in_length, per_channel=False, width=(32, 48, 64),
     return model, summary, n_params, cfg
 
 
+class AdditiveNet(nn.Module):
+    """Сумма вкладов: каждый канал идёт через СВОЮ свёртку и СВОЙ персептрон, каналы не
+    смешиваются, выходы ветвей складываются.
+
+    Чем отличается от остальных архитектур проекта:
+
+    * от ``compact`` и ``mse24`` — межканальных сочетаний нет вообще. Класс функций строго
+      аддитивный: f(x) = сумма f_j(x_j) + смещение. Подогнать произведение «тепло × сухость»
+      или сочетание каналов, опознающее конкретный год, модель не может в принципе.
+    * от ``compact_pc`` — там раздельным был только первый слой, дальше каналы смешивались.
+      Здесь ветви не встречаются до самого сложения.
+    * от ансамбля одноканальных моделей (``ensemble_single.py``) — там каждая модель обучалась
+      предсказывать ВСЁ отклонение целиком, в одиночку, и потом прогнозы усреднялись. Здесь
+      ветви обучаются вместе и делят остаток: ветвь добавляет только то, чего не объяснили
+      другие. Это другой класс моделей, а не то же самое с другим весом.
+
+    Побочная выгода: выход каждой ветви — это и есть вклад канала в ответ, в тех же единицах,
+    что ответ. Поэтому вклад признаков можно показать ЧЕСТНО, на честном сплите, не прибегая к
+    перестановкам и прочим косвенным приёмам.
+    """
+
+    def __init__(self, in_channels, in_length, width=(16, 24, 32), head=32, dropout=0.2):
+        super().__init__()
+        c1, c2, c3 = width
+        def branch():
+            return nn.Sequential(
+                nn.Conv1d(1, c1, kernel_size=9, padding=4), nn.BatchNorm1d(c1),
+                nn.ReLU(inplace=True), nn.MaxPool1d(4),
+                nn.Conv1d(c1, c2, kernel_size=7, padding=3), nn.BatchNorm1d(c2),
+                nn.ReLU(inplace=True), nn.MaxPool1d(4),
+                nn.Conv1d(c2, c3, kernel_size=5, padding=2), nn.BatchNorm1d(c3),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool1d(2), nn.Flatten(), nn.Dropout(dropout),
+                nn.Linear(c3 * 2, head), nn.ReLU(inplace=True), nn.Linear(head, 1))
+        self.branches = nn.ModuleList([branch() for _ in range(in_channels)])
+        self.bias = nn.Parameter(torch.zeros(1))
+
+    def contributions(self, x):
+        """Вклад каждого канала отдельно. -> (B, каналов)."""
+        return torch.cat([b(x[:, i:i + 1, :]) for i, b in enumerate(self.branches)], dim=1)
+
+    def forward(self, x):
+        return self.contributions(x).sum(dim=1) + self.bias
+
+
+def build_additive(in_channels, in_length, width=(16, 24, 32), head=32):
+    """Аддитивная модель: ветвь на канал, выходы складываются. -> (model, текст, весов, cfg)."""
+    model = AdditiveNet(in_channels, in_length, width, head)
+    n_params = sum(p.numel() for p in model.parameters())
+    per = sum(p.numel() for p in model.branches[0].parameters())
+    c1, c2, c3 = width
+    summary = ('Аддитивная сеть (ветвь на канал, каналы не смешиваются, выходы складываются):\n'
+               f'  ветвь: Conv1d(1->{c1}, k=9) -> BN -> ReLU -> MaxPool(4)\n'
+               f'         Conv1d({c1}->{c2}, k=7) -> BN -> ReLU -> MaxPool(4)\n'
+               f'         Conv1d({c2}->{c3}, k=5) -> BN -> ReLU -> AdaptiveAvgPool1d(2)\n'
+               f'         Dropout -> Linear({c3 * 2}->{head}) -> ReLU -> {head}->1\n'
+               f'  ответ = сумма {in_channels} ветвей + общее смещение\n'
+               f'  Параметров: {n_params:,} (на ветвь {per:,})')
+    cfg = {'style': 'additive', 'branches': in_channels, 'conv_channels': [c1, c2, c3],
+           'head': head, 'pool': 'avg2', 'batchnorm': True, 'activation': 'relu',
+           'cross_channel': False}
+    return model, summary, n_params, cfg
+
+
 def make_model(arch, in_channels, in_length):
     """Вернуть (model, summary_text, n_params, cfg) по имени архитектуры."""
+    if arch == 'additive':              # ветвь на канал, выходы складываются
+        return build_additive(in_channels, in_length)
+    if arch == 'additive_wide':
+        return build_additive(in_channels, in_length, width=(32, 48, 64), head=64)
     if arch == 'compact':
         return build_compact(in_channels, in_length)
     if arch == 'compact_pc':            # то же, но первый слой раздельный по входным каналам

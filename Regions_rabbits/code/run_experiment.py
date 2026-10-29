@@ -247,10 +247,11 @@ def main():
                     help='year — отсечки только в целевом году (честно), full — по всему ряду')
     ap.add_argument('--channels', default='raw', choices=['raw', 'relative'],
                     help='raw — ряды как есть; relative — ряд минус норма района (нужен список 4)')
-    ap.add_argument('--arch', default=ARCH, choices=['cnn', 'mse24', 'conv', 'compact', 'compact_pc'],
+    ap.add_argument('--arch', default=ARCH, choices=['cnn', 'mse24', 'conv', 'compact', 'compact_pc', 'additive', 'additive_wide'],
                     help='архитектура: mse24 — 12.2 млн весов, cnn — 1.2 млн, '
                          'compact — ~50 тыс. (свёртки + усреднение по времени), '
-                         'compact_pc — то же с раздельным первым слоем')
+                         'compact_pc — то же с раздельным первым слоем, '
+                         'additive — ветвь на канал без смешивания, выходы складываются')
     ap.add_argument('--years-kept', type=int, default=0,
                     help='сколько последних лет ряда оставить (0 — весь ряд); '
                          'остальные зануляются после нормировки')
