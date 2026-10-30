@@ -226,6 +226,54 @@ def block_definition(pairs, plan, mode='interleaved', n_groups=2, seed=42):
     return pd.DataFrame(rows), {'groups': groups, 'halves': halves, 'level': level}
 
 
+def loo_definition(pairs, plan, n_groups=2, seed=42):
+    """Один год из всех × группа районов. -> (DataFrame ролей, сведения).
+
+    Требование то же, что у ``block_definition``: обучение и тест не пересекаются ни по
+    районам, ни по годам. Разница в том, как резать год. Решётка 2×2 отдаёт тесту половину
+    лет, и обучению остаётся всего три года (четвёртый уходит в валидацию). Но эффективный
+    размер выборки определяется почти целиком числом ЛЕТ: район-годы одного года — это
+    примерно одно независимое наблюдение. Поэтому выгоднее изымать по ОДНОМУ году::
+
+        тест   = группа g, год Y                      (районы чужие, год чужой)
+        обуч   = группа 1-g, все годы кроме Y и года валидации
+        валид  = группа 1-g, один год, не Y
+
+    Фолдов получается «лет × групп» = 16 вместо четырёх, обучающих лет шесть вместо трёх.
+    Цена: тест каждого фолда — один год, то есть один розыгрыш уровня года, и по одному
+    фолду судить нельзя. Судить надо по среднему и разбросу всех шестнадцати, зато разброс
+    тогда измеряется по восьми РАЗНЫМ годам, а не по двум половинам.
+    """
+    groups = district_groups(pairs, plan, n_groups, seed=seed)
+    have = set(pairs)
+    sub = plan[[(t, int(y)) in have for t, y in zip(plan['territory_id'], plan['year'])]]
+    level = {int(y): float(v) for y, v in sub.groupby('year')['productive'].mean().items()}
+    by_group = {}
+    for (t, y) in pairs:
+        g = groups.get(t)
+        if g is not None and int(y) in level:
+            by_group.setdefault(g, set()).add((t, int(y)))
+
+    rows = []
+    for test_year in sorted(level):
+        for g in sorted(by_group):
+            test_pairs = {(t, y) for (t, y) in by_group[g] if y == test_year}
+            pool = {(t, y) for gg in by_group if gg != g for (t, y) in by_group[gg]
+                    if y != test_year}
+            if not test_pairs or not pool:
+                continue
+            pool_years = sorted({y for _t, y in pool})
+            mean_lv = np.mean([level[y] for y in pool_years])
+            val_year = min(pool_years, key=lambda y: abs(level[y] - mean_lv))
+            val_pairs = {(t, y) for (t, y) in pool if y == val_year}
+            train_pairs = pool - val_pairs
+            fold = f'{test_year}|g{g}'
+            for role, pp in (('train', train_pairs), ('val', val_pairs), ('test', test_pairs)):
+                rows.extend({'fold': fold, 'territory_id': t, 'year': int(y), 'role': role}
+                            for (t, y) in sorted(pp))
+    return pd.DataFrame(rows), {'groups': groups, 'level': level}
+
+
 def ladder_definition(pairs, plan, test_years, n_groups=2, gap=1, seed=42):
     """«Лесенка утечек»: четыре режима обучения на ОДНОМ И ТОМ ЖЕ тесте. -> DataFrame ролей.
 
@@ -324,6 +372,9 @@ def main():
     ap.add_argument('--blocks', action='store_true',
                     help='разбиение блоками: группы районов × половины лет, обучение и тест '
                          'не пересекаются ни по районам, ни по годам')
+    ap.add_argument('--loo', action='store_true',
+                    help='один год из всех × группа районов: то же требование, что у --blocks, '
+                         'но обучающих лет шесть вместо трёх, а фолдов шестнадцать')
     ap.add_argument('--year-mode', default='interleaved', choices=['interleaved', 'chrono'],
                     help='как делить годы: interleaved — поровну урожайных и неурожайных '
                          '(уровни половин совпадают), chrono — ранние против поздних')
@@ -336,6 +387,26 @@ def main():
     print(f'общая выборка (есть во всех заданиях): {len(pairs)} пар «район, год», '
           f'районов {pairs["territory_id"].nunique()}, годы '
           f'{pairs["year"].min()}–{pairs["year"].max()}')
+
+    if a.loo:
+        plan = load_plan(a.tasks[0])
+        plan = plan[valid_mask(plan)]
+        pp = set(zip(pairs['territory_id'], pairs['year']))
+        df, info = loo_definition(pp, plan, n_groups=a.groups)
+        os.makedirs(FOLDS_DIR, exist_ok=True)
+        path = os.path.join(FOLDS_DIR, f'{a.name}.csv')
+        df.to_csv(path, index=False, sep=';', decimal=',', encoding='utf-8-sig')
+        gr = pd.Series(info['groups'])
+        print('\nрайонов в группах: ' + ', '.join(
+            f'g{g} — {int(n)}' for g, n in gr.value_counts().sort_index().items()))
+        print('уровень по годам, ц/га: ' + ', '.join(
+            f'{y} {v:.1f}' for y, v in sorted(info['level'].items())))
+        cnt = df.pivot_table(index='fold', columns='role', values='year', aggfunc='count')
+        cnt['лет_обуч'] = df[df.role == 'train'].groupby('fold')['year'].nunique()
+        print('\nсостав фолдов (пар на роль):')
+        print(cnt[['train', 'val', 'test', 'лет_обуч']].to_string())
+        print(f'\nсхема сохранена: {path}')
+        return
 
     if a.blocks:
         plan = load_plan(a.tasks[0])
