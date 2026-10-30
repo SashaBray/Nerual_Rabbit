@@ -275,12 +275,18 @@ def district_rows(d, target, form, min_years, scheme):
 def _agg(df, label):
     """Сводка по подмножеству районов."""
     if df.empty:
-        return {'выборка': label, 'районов': 0}
+        return {'выборка': label, 'районов': 0,
+                **{k: np.nan for k in ('R2_медиана', 'R2_среднее', 'R2>0_доля',
+                                       'RMSE_медиана', 'RMSE_эталон', 'уровень',
+                                       'RMSE%_медиана', 'r_медиана')}}
     r2, rp = df['R2'].astype(float), df['RMSE_проц'].astype(float)
     return {'выборка': label, 'районов': len(df),
             'R2_медиана': round(float(r2.median()), 3),
             'R2_среднее': round(float(r2.mean()), 3),
             'R2>0_доля': round(float((r2 > 0).mean()), 3),
+            'RMSE_медиана': round(float(df['RMSE'].median()), 2),
+            'RMSE_эталон': round(float(df['RMSE_эталон'].median()), 2),
+            'уровень': round(float(df['среднее'].median()), 2),
             'RMSE%_медиана': round(float(rp.median()), 1),
             'r_медиана': round(float(df['r'].median()), 3)}
 
@@ -413,6 +419,17 @@ def _plots(outdir, dd, d, form, scheme):
     return imgs
 
 
+ABS_COLS = ('RMSE_медиана', 'RMSE_эталон', 'уровень')
+
+
+def _fmt_abs(v):
+    """Абсолютная величина в таблицу: ц/га — с двумя знаками, центнеры — без дробей."""
+    v = float(v)
+    if not np.isfinite(v):
+        return ''
+    return f'{v:.2f}' if abs(v) < 1000 else f'{v:,.0f}'.replace(',', '\u00a0')
+
+
 def _docx(outdir, title, meta, diag, sdf, mdf, dd, imgs, form, scheme):
     from docx import Document
     from docx.shared import Inches
@@ -497,7 +514,55 @@ def _docx(outdir, title, meta, diag, sdf, mdf, dd, imgs, form, scheme):
         'годам. Третья строка — честная: во второй район отбирается по той же корреляции, '
         'которую потом и подтверждает, и число получается завышенным.')
     sel = (sdf['форма'] == form) & (sdf['схема'] == scheme)
-    E._table_from_df(doc, sdf[sel].drop(columns=['форма', 'схема']), maxrows=30)
+    E._table_from_df(doc, sdf[sel].drop(columns=['форма', 'схема', *ABS_COLS],
+                                        errors='ignore'), maxrows=30)
+
+    q = {}
+    for t in TARGETS:
+        v = sdf[(sdf['форма'] == form) & (sdf['схема'] == scheme) & (sdf['цель'] == t)]
+        q[t] = (v[v['выборка'] == 'все районы'].iloc[0],
+                v[v['выборка'] == 'r > 0.5 (отбор по обучающим)'].iloc[0])
+
+    doc.add_heading('Абсолютная ошибка и чем она отличается от R²', level=1)
+    doc.add_paragraph(
+        'R² — величина относительная: он сравнивает модель с эталоном и ничего не говорит о '
+        'том, на сколько центнеров мы ошибаемся. Поэтому та же таблица в исходных единицах — '
+        'медианная по районам ошибка модели, ошибка эталона (средней района) и типичный '
+        'уровень цели, чтобы ошибку было с чем соотнести.')
+    at = sdf[(sdf['форма'] == form) & (sdf['схема'] == scheme)].copy()
+    at['ед.'] = at['цель'].map(UNITS)
+    for c in ABS_COLS:
+        at[c] = at[c].map(_fmt_abs)
+    E._table_from_df(doc, at[['цель', 'ед.', 'выборка', 'районов', 'RMSE_медиана',
+                              'RMSE_эталон', 'уровень', 'RMSE%_медиана', 'R2_медиана']],
+                     maxrows=30)
+
+    a0, a1 = q['убранная']
+    doc.add_paragraph(
+        f'Здесь видно то, чего по R² не видно. При отборе районов по корреляции медианная '
+        f'ошибка модели меняется с {_fmt_abs(a0["RMSE_медиана"])} на '
+        f'{_fmt_abs(a1["RMSE_медиана"])} {UNITS["убранная"]}, а ошибка эталона — с '
+        f'{_fmt_abs(a0["RMSE_эталон"])} на {_fmt_abs(a1["RMSE_эталон"])}. R² при этом '
+        f'поднимается с {a0["R2_медиана"]} до {a1["R2_медиана"]}. То есть рост R² обеспечен '
+        f'не столько тем, что мы точнее в центнерах, сколько тем, что у отобранных районов '
+        f'хуже справляется эталон: урожайность там колеблется сильнее, и пик NDVI успевает '
+        f'объяснить большую долю этого разброса. Критерий r > 0.5 выбирает районы с большой '
+        f'изменчивостью, а не районы, где прогноз в центнерах надёжнее.')
+    lo, hi = sorted([float(a0['RMSE_медиана']), float(a1['RMSE_медиана'])])
+    doc.add_paragraph(
+        f'Для продукта, который обещает «процент от нормы», значимо именно абсолютное число: '
+        f'{_fmt_abs(lo)}–{_fmt_abs(hi)} {UNITS["убранная"]} при типичной урожайности '
+        f'{_fmt_abs(a0["уровень"])}, то есть около {a0["RMSE%_медиана"]:.0f} % урожая. '
+        f'Отбор районов этого почти не меняет.')
+    g0, g1 = q['валовая']
+    doc.add_paragraph(
+        f'У валового сбора абсолютные числа между районами несравнимы: он измеряется в '
+        f'{UNITS["валовая"]} и зависит от размера района. Медианная ошибка меняется с '
+        f'{_fmt_abs(g0["RMSE_медиана"])} на {_fmt_abs(g1["RMSE_медиана"])}, и это движение '
+        f'почти целиком про размер района, а не про точность: типичный сбор у отобранных '
+        f'районов {_fmt_abs(g1["уровень"])} против {_fmt_abs(g0["уровень"])} по всем. Для '
+        f'этой цели районы сравнимы только в процентах: {g0["RMSE%_медиана"]} % и '
+        f'{g1["RMSE%_медиана"]} %.')
 
     other_sch = [s for s in SCHEMES if s != scheme][0]
     doc.add_heading(f'Схема «{other_sch}»', level=1)
@@ -506,13 +571,15 @@ def _docx(outdir, title, meta, diag, sdf, mdf, dd, imgs, form, scheme):
         'района. Эта таблица строже и ближе к работе: на каждый год отвечает линия, построенная '
         'только по предыдущим годам.')
     sel = (sdf['форма'] == form) & (sdf['схема'] == other_sch)
-    E._table_from_df(doc, sdf[sel].drop(columns=['форма', 'схема']), maxrows=30)
+    E._table_from_df(doc, sdf[sel].drop(columns=['форма', 'схема', *ABS_COLS],
+                                        errors='ignore'), maxrows=30)
 
     doc.add_heading('Вторая форма зависимости', level=1)
     other = [f for f in FORMS if f != form][0]
     doc.add_paragraph(f'Схема «{scheme}», но линия — {other}.')
     sel = (sdf['форма'] == other) & (sdf['схема'] == scheme)
-    E._table_from_df(doc, sdf[sel].drop(columns=['форма', 'схема']), maxrows=30)
+    E._table_from_df(doc, sdf[sel].drop(columns=['форма', 'схема', *ABS_COLS],
+                                        errors='ignore'), maxrows=30)
 
     doc.add_heading('Разбивка по маскам NDVI', level=1)
     E._table_from_df(doc, mdf, maxrows=30)
@@ -525,7 +592,8 @@ def _docx(outdir, title, meta, diag, sdf, mdf, dd, imgs, form, scheme):
 
     s = dd[(dd['форма'] == form) & (dd['схема'] == scheme)
            & (dd['цель'] == 'убранная')].copy()
-    show = ['territory_id', 'регион', 'район', 'лет', 'r', 'R2', 'RMSE', 'RMSE_проц']
+    show = ['territory_id', 'регион', 'район', 'лет', 'r', 'R2', 'RMSE', 'RMSE_эталон',
+            'среднее', 'RMSE_проц']
     show = [c for c in show if c in s.columns]
     doc.add_heading('20 районов с лучшей точностью (цель «убранная»)', level=1)
     E._table_from_df(doc, s.sort_values('R2', ascending=False)[show].round(3), maxrows=20)
@@ -533,11 +601,6 @@ def _docx(outdir, title, meta, diag, sdf, mdf, dd, imgs, form, scheme):
     E._table_from_df(doc, s.sort_values('R2')[show].round(3), maxrows=20)
 
     doc.add_heading('Что из этого следует', level=1)
-    q = {}
-    for t in TARGETS:
-        v = sdf[(sdf['форма'] == form) & (sdf['схема'] == scheme) & (sdf['цель'] == t)]
-        q[t] = (v[v['выборка'] == 'все районы'].iloc[0],
-                v[v['выборка'] == 'r > 0.5 (отбор по обучающим)'].iloc[0])
     for s in (
         f'Пик NDVI действительно несёт сигнал, но немного. По всем районам медианный R² = '
         f'{q["убранная"][0]["R2_медиана"]} для урожайности на убранную площадь: регрессия '
@@ -559,7 +622,11 @@ def _docx(outdir, title, meta, diag, sdf, mdf, dd, imgs, form, scheme):
         f'тесная (r > 0.5), медианный R² поднимается до {q["убранная"][1]["R2_медиана"]}, '
         f'и таких районов {q["убранная"][1]["районов"]} из {q["убранная"][0]["районов"]}. '
         'Это и есть практический вывод для продукта: район должен сам доказать, что в нём '
-        'регрессия работает, и только тогда ей можно верить.',
+        'регрессия работает, и только тогда ей можно верить. Но рост R² не означает такого '
+        'же роста точности: абсолютная ошибка при отборе почти не меняется '
+        f'({_fmt_abs(q["убранная"][0]["RMSE_медиана"])} против '
+        f'{_fmt_abs(q["убранная"][1]["RMSE_медиана"])} {UNITS["убранная"]}), растёт в '
+        'основном ошибка эталона — подробнее в разделе «Абсолютная ошибка».',
         'А вот отбор по всей истории против отбора по обучающим годам почти не расходится: '
         'два критерия выбирают практически одни и те же районы, и медианы совпадают в третьем '
         'знаке. То есть привычная практика «посчитали корреляцию по всей истории и отобрали '
@@ -586,7 +653,8 @@ def _docx(outdir, title, meta, diag, sdf, mdf, dd, imgs, form, scheme):
     for s in ('per_district.csv — длинная таблица: район × цель × форма, со всеми метриками;',
               'map_table.csv — по одной строке на район, метрики по целям в столбцах. '
               'Это таблица для раскраски карты: есть territory_id, id_region, id_district, '
-              'названия региона и района, маска NDVI, число лет и точность;',
+              'названия региона и района, маска NDVI, число лет, точность в процентах и в '
+              'центнерах (RMSE), ошибка эталона (RMSE_эталон) и уровень цели (среднее);',
               'summary.csv — сводка; peaks.csv — пики NDVI по району и году (кэш).'):
         doc.add_paragraph(s, style='List Bullet')
     doc.add_paragraph(f'Каталог: {outdir}')
@@ -665,7 +733,8 @@ def run(culture, min_years, form, rebuild):
     # широкая таблица для карты: одна строка на район
     wide = dd[main].pivot_table(
         index=['territory_id', 'id_region', 'id_district', 'регион', 'район', 'маска', 'лет'],
-        columns='цель', values=['r', 'R2', 'RMSE', 'RMSE_проц'], aggfunc='first')
+        columns='цель', values=['r', 'R2', 'RMSE', 'RMSE_эталон', 'RMSE_проц', 'среднее'],
+        aggfunc='first')
     wide.columns = [f'{a}_{b}' for a, b in wide.columns]
     wide = wide.round(4).reset_index()
     past = (dd[(dd['форма'] == form) & (dd['схема'] == SCHEMES[1])]
