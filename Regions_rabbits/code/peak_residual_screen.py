@@ -25,6 +25,24 @@
 налива зерна, поэтому эта информация ортогональна пику по построению. ``осень_пред`` — сев и
 уход в зиму, дни прошлого года (в ряду они идут со сдвигом −365).
 
+Две семьи кандидатов сверх этих окон. Первая: то же значение, но как ОТКЛОНЕНИЕ от нормы
+района по предыдущим годам (суффикс ``@нормаN``). Норма по всей истории района в работе не
+существует — в год Y известны только годы до Y, — а вычитание нормы само по себе заметно
+поднимает внутригодовую корреляцию: признак начинает говорить «этот год здесь необычный», а
+не «здесь так всегда». Вторая семья — фаза. Любая сводка по окну складывает два разных
+события в одно число: район ОТСТАЛ в развитии и район вышел СЛАБЫМ дают одинаково низкий
+весенний интеграл, а агрономически это разные беды. Поэтому кривая года совмещается со
+средней кривой того же района по прошлым годам сдвигом по времени, и сдвиг
+(``фаза_сдвиг``, дни; положительный — развитие ОПЕРЕЖАЕТ норму района), амплитуда
+(``фаза_ампл``) и остаток формы после совмещения (``фаза_форма``) докладываются по
+отдельности.
+
+Отбирается не один лучший признак, а сумма трёх с РАВНЫМИ весами. Отбор одного среди сотен
+кандидатов шумен сам по себе: критерий отбора сам оценён по десяти годам, и признак,
+случайно удачный на обучении, вытесняет верный. Сумма ничего не подгоняет, и мерится это
+прямо: лучший один даёт внутригодовую корреляцию 0.07 на отложенных годах, сумма трёх —
+0.18 (озимая пшеница, 398 кандидатов).
+
 Чем такой перебор обманывает. На двух сотнях кандидатов и нескольких тысячах строк
 корреляция 0.1–0.15 находится на чистом шуме. Поэтому:
 
@@ -45,8 +63,8 @@
     python code/peak_residual_screen.py --culture "Яровая пшеница" --min-years 6
 
 Выход: ``workspace/reports/peak_residual/<задание>/`` — ``candidates.csv`` (все кандидаты с
-честными корреляциями), ``folds.csv`` (по фолдам), ``residuals.csv``, ``features.csv`` (кэш),
-графики; плюс отчёт ``docs/Остаток_пика_NDVI_<культура>.docx``.
+честными корреляциями), ``folds.csv`` (по фолдам), ``residuals.csv``, ``features.csv`` и
+``phase.csv`` (кэши), графики; плюс отчёт ``docs/Остаток_пика_NDVI_<культура>.docx``.
 """
 import argparse
 import os
@@ -81,12 +99,20 @@ PARMS = {
 NDVI_SUMM = ('макс', 'сред', 'накоп', 'наклон')
 BDPMO_FEATS = ('площадь_отн', 'удобр_отн')
 GDD_BASE = 5.0          # база эффективных температур, °C
+NORM_YEARS = 4          # норма района по последним N ПРОШЛЫМ годам: столько есть и в проде
+PHASE_FROM = 60         # с какого дня года кривая NDVI кладётся на суточную сетку
+PHASE_SHIFT = 30        # на сколько дней разрешено сдвигать кривую при совмещении
 MIN_PAIRS = 200         # меньше пар — корреляцию не считаем
 TOP_K = 10              # сколько признаков берёт гребневая поправка
 ALPHA = 10.0            # штраф гребня; не подбирался, взят с запасом
 SCHEMES = ('год', 'районы', 'год_внутри')
+SUM_K = 3               # сколько признаков берёт сумма с равными весами
+# объявленная заранее тройка сводок кривой NDVI: сколько, когда, как быстро падает
+TRIPLE = ('накоп|весна', 'фаза_сдвиг|до_пика', 'наклон|после_пика')
 COLS = ['фолд', 'лучший_признак', 'r_обуч', 'r_тест', 'r_внутри_тест',
         'ΔRMSE_внутр', 'ΔRMSE_один', f'ΔRMSE_топ{TOP_K}']
+COMP_COLS = ['фолд', 'r_внутри_тест', f'r_внутри_сум{SUM_K}', 'r_внутри_тройка',
+             'ΔRMSE_внутр', f'ΔRMSE_сум{SUM_K}', 'ΔRMSE_тройка']
 
 
 # --------------------------------------------------------------------------- #
@@ -232,6 +258,130 @@ def features_table(rl, mask_parm, hdoy, cache):
     return f
 
 
+def _grid_curve(a, lo, hi):
+    """Кривая на суточной сетке [lo, hi] из ряда (день, значение). -> массив или None."""
+    if a.size == 0:
+        return None
+    m = (a[:, 0] >= lo - 20) & (a[:, 0] <= hi + 20) & (a[:, 1] > 0)
+    if m.sum() < 8:
+        return None
+    d, v = a[m, 0], a[m, 1]
+    o = np.argsort(d)
+    return np.interp(np.arange(lo, hi + 1), d[o], v[o])
+
+
+def _align(c, prev, lo, hi_w):
+    """Совмещение кривой года с нормой района по прошлым годам сдвигом по времени.
+
+    Сдвиг ищется по максимуму корреляции, а не по минимуму ошибки: корреляция не зависит от
+    масштаба, поэтому «отстал» и «вышел слабым» не путаются между собой. -> (сдвиг в днях,
+    отношение амплитуд, относительный остаток формы).
+
+    Знак сдвига: значение года в день t−sh сравнивается с нормой в день t, поэтому
+    положительный sh означает, что район приходит в то же состояние РАНЬШЕ своей нормы —
+    развитие опережает. Проверка знака: корреляция sh с днём пика той же съёмки −0.42.
+    """
+    if c is None or len(prev) < 2:
+        return np.nan, np.nan, np.nan
+    ref = np.mean(np.vstack(prev), axis=0)
+    a, b = PHASE_SHIFT, int(hi_w - lo)
+    if b - a < 20:
+        return np.nan, np.nan, np.nan
+    t = np.arange(a, b + 1)
+    r = ref[t]
+    rc = r - r.mean()
+    nr = float(np.sqrt(rc @ rc))
+    if not np.isfinite(r).all() or r.mean() <= 0 or nr <= 1e-9:
+        return np.nan, np.nan, np.nan
+    best = None
+    for sh in range(-PHASE_SHIFT, PHASE_SHIFT + 1):
+        v = c[t - sh]
+        vc = v - v.mean()
+        nv = float(np.sqrt(vc @ vc))
+        if nv <= 1e-9:
+            continue
+        g = float(vc @ rc) / (nv * nr)
+        if best is None or g > best[1]:
+            best = (sh, g, v)
+    if best is None:
+        return np.nan, np.nan, np.nan
+    sh, _g, v = best
+    amp = float(v.mean() / r.mean())
+    if not np.isfinite(amp) or amp <= 0:
+        return float(sh), np.nan, np.nan
+    res = float(np.sqrt(np.mean((v / amp - r) ** 2)) / r.mean())
+    return float(sh), amp, res
+
+
+def phase_table(rl, mask_parm, hdoy, cache, window):
+    """Фаза, амплитуда и остаток формы кривой NDVI против нормы района по прошлым годам.
+
+    Норма берётся только по ПРЕДЫДУЩИМ годам: в год Y других в работе и нет. Кэшируется
+    отдельно от features.csv, чтобы не пересчитывать погодные сводки.
+    """
+    if os.path.exists(cache):
+        print(f'фаза: беру из {os.path.basename(cache)}')
+        f = pd.read_csv(cache, sep=';', decimal=',', encoding='utf-8-sig')
+        f['territory_id'] = f['territory_id'].astype(str)
+        return f
+    lo, hi = PHASE_FROM, int(hdoy)
+    keys = rl[['territory_id', 'year', 'день_пика']].drop_duplicates()
+    out, t0 = [], time.time()
+    for i, (tid, grp) in enumerate(keys.groupby('territory_id'), 1):
+        grp = grp.sort_values('year')
+        cur, peaks = {}, {}
+        for _j, r in grp.iterrows():
+            yr = int(r['year'])
+            a = np.asarray(db.get_time_series(tid, mask_parm, yr), dtype=float)
+            cur[yr] = _grid_curve(a if a.size else np.empty((0, 2)), lo, hi)
+            peaks[yr] = int(r['день_пика'])
+        ys = sorted(cur)
+        for k, yr in enumerate(ys):
+            row = {'territory_id': tid, 'year': yr}
+            prev = [cur[y] for y in ys[max(0, k - window):k] if cur[y] is not None]
+            for wn, hw in (('до_пика', peaks[yr]), ('сезон', hi - PHASE_SHIFT)):
+                sh, amp, res = _align(cur[yr], prev, lo, min(hw, hi - PHASE_SHIFT))
+                row[f'ndvi|фаза_сдвиг|{wn}'] = sh
+                row[f'ndvi|фаза_ампл|{wn}'] = amp
+                row[f'ndvi|фаза_форма|{wn}'] = res
+            out.append(row)
+        if i % 150 == 0:
+            print(f'    фаза: районов {i}, {time.time() - t0:.0f} c', flush=True)
+    f = pd.DataFrame(out)
+    f.round(4).to_csv(cache, sep=';', decimal=',', index=False, encoding='utf-8-sig')
+    print(f'фаза: {f.shape[1] - 2} признака, {time.time() - t0:.0f} c')
+    return f
+
+
+def _past_anomaly(X, tid, yr, window):
+    """Отклонение каждого признака от нормы района по ПРЕДЫДУЩИМ годам.
+
+    Отличие от ``_zscore`` принципиальное, хотя обе функции вычитают норму района. Там норма
+    считается по всем (или по обучающим) годам сразу — в работе такой нормы нет: в июле года
+    Y известны только годы до Y. Здесь норма честная, и её можно посчитать в проде. Первый
+    год района и годы, где прошлых значений меньше двух, остаются пустыми — это и есть цена.
+    """
+    A = np.full_like(X, np.nan)
+    for t in np.unique(tid):
+        k = np.flatnonzero(tid == t)
+        k = k[np.argsort(yr[k])]
+        for i in range(1, len(k)):
+            p = X[k[max(0, i - window):i]]
+            ok = np.isfinite(p)
+            n = ok.sum(axis=0)
+            mu = np.where(n >= 2, np.nansum(np.where(ok, p, 0.0), axis=0) / np.maximum(n, 1),
+                          np.nan)
+            A[k[i]] = X[k[i]] - mu
+    return A
+
+
+def _family(name):
+    """К какой семье кандидат относится: нормировка по всей истории, по прошлым годам, фаза."""
+    if 'фаза' in name:
+        return 'фаза'
+    return 'норма_прошлых' if '@норма' in name else 'вся_история'
+
+
 # --------------------------------------------------------------------------- #
 # Честный перебор
 # --------------------------------------------------------------------------- #
@@ -316,6 +466,33 @@ def _delta_rmse_in(z, ynorm, yabs, sd, yr, train, test):
     return float(np.mean(out)) if out else np.nan
 
 
+def _composite(Z, cols, score):
+    """Сумма отобранных признаков с РАВНЫМИ весами; знак каждого — по знаку его оценки.
+
+    Зачем это вместо лучшего одного. Критерий отбора сам оценивается по десяти годам, и
+    среди сотен кандидатов всегда найдётся случайно удачный на обучении — он и вытеснит
+    верный. Сумма не подгоняет ни одного коэффициента, поэтому этой ошибки почти не делает.
+    Второй довод измерен: удачи признаков по годам отрицательно коррелируют (−0.29 у
+    весеннего интеграла со сдвигом фазы), то есть они страхуют друг друга.
+    """
+    g = np.sign(np.nan_to_num(score[cols]))
+    g = np.where(g == 0, 1.0, g)
+    A = np.where(np.isfinite(Z[:, cols]), Z[:, cols], 0.0) * g
+    return A.mean(axis=1)
+
+
+def _triple_idx(names):
+    """Индексы объявленной тройки сводок кривой NDVI. -> список или None."""
+    out = []
+    for suf in TRIPLE:
+        k = [i for i, n in enumerate(names)
+             if n.endswith(suf) and 'ndvi' in n and '@норма' not in n]
+        if len(k) != 1:
+            return None
+        out.append(k[0])
+    return out
+
+
 def within_year_matrix(X, tid, yr, ynorm):
     """Матрица «год x кандидат» внутригодовых корреляций. -> (годы, матрица)."""
     Z = _zscore(X, tid, np.ones(len(tid), bool))
@@ -338,6 +515,20 @@ def within_year(X, tid, yr, ynorm):
     """
     _years, R = within_year_matrix(X, tid, yr, ynorm)
     return np.nanmean(R, axis=0)
+
+
+def _comp_cols(Z, order, tri, score, ynorm, yabs, sd, yr, train, test):
+    """Столбцы по суммам: отобранная топ-SUM_K и объявленная заранее тройка NDVI."""
+    out = {}
+    for lbl, cols in ((f'сум{SUM_K}', [int(j) for j in order[:SUM_K]]), ('тройка', tri)):
+        if cols is None:
+            out[f'r_внутри_{lbl}'] = np.nan
+            out[f'ΔRMSE_{lbl}'] = np.nan
+            continue
+        c = _composite(Z, cols, score)
+        out[f'r_внутри_{lbl}'] = round(_rho_in(c, ynorm, yr, test), 4)
+        out[f'ΔRMSE_{lbl}'] = round(_delta_rmse_in(c, ynorm, yabs, sd, yr, train, test), 4)
+    return out
 
 
 def screen(rl, X, names, scheme, shuffle=False, seed=1):
@@ -365,6 +556,7 @@ def screen(rl, X, names, scheme, shuffle=False, seed=1):
     # отбор в схеме «год_внутри» идёт по способности упорядочить районы внутри обучающих лет
     ry = within_year_matrix(X, tid, yr, ynorm) if scheme == 'год_внутри' else (None, None)
 
+    tri = _triple_idx(names)
     frows, tests, trains = [], [], []
     for fname, train, test in folds:
         Z = _zscore(X, tid, train if scheme == 'год' else np.ones(len(tid), bool))
@@ -393,6 +585,7 @@ def screen(rl, X, names, scheme, shuffle=False, seed=1):
                                                           yr, train, test), 4),
                       'ΔRMSE_один': round(_delta_rmse(Z[:, best], ynorm, yabs, sd,
                                                       train, test), 4),
+                      **_comp_cols(Z, order, tri, score, ynorm, yabs, sd, yr, train, test),
                       f'ΔRMSE_топ{TOP_K}': round(_delta_ridge(Z, ynorm, yabs, sd,
                                                               train, test, top), 4)})
     Za = _zscore(X, tid, np.ones(len(tid), bool))
@@ -402,7 +595,8 @@ def screen(rl, X, names, scheme, shuffle=False, seed=1):
                          'r_обуч_сред': np.nanmean(np.vstack(trains), axis=0).round(4),
                          'r_тест_сред': np.nanmean(np.vstack(tests), axis=0).round(4),
                          'r_внутри_года': within_year(X, tid, yr, ynorm).round(4),
-                         'фолдов': np.isfinite(np.vstack(tests)).sum(axis=0)})
+                         'фолдов': np.isfinite(np.vstack(tests)).sum(axis=0),
+                         'семья': [_family(n) for n in names]})
     cand['|r_тест|'] = cand['r_тест_сред'].abs().round(4)
     cand['покрытие'] = cand['фолдов'] >= int(0.8 * max(cand['фолдов'].max(), 1))
     return pd.DataFrame(frows), cand.sort_values('|r_тест|', ascending=False)
@@ -500,6 +694,21 @@ def _docx(outdir, title, meta, folds, cand, cand_sh, imgs):
     doc.add_paragraph(
         'Признак «остаток прошлого года» сознательно исключён: при исключении года его '
         'расчёт подсматривает отвечаемый год.')
+    doc.add_paragraph(
+        f'Каждая сводка перебирается дважды. Первый раз — как есть, с нормировкой внутри '
+        f'района по всем доступным годам. Второй раз — как отклонение от нормы района по '
+        f'последним {meta["norm"]} ПРОШЛЫМ годам (суффикс «@норма{meta["norm"]}»). Вторая '
+        f'форма честнее: нормы по всей истории в работе не существует, в год Y известны '
+        f'только годы до Y. Цена — первые годы каждого района остаются пустыми.')
+    doc.add_paragraph(
+        f'Отдельно считается фаза кривой NDVI. Любая сводка по окну складывает два разных '
+        f'события в одно число: район отстал в развитии и район вышел слабым дают одинаково '
+        f'низкий весенний интеграл, а это разные беды с разным исходом. Поэтому кривая года '
+        f'совмещается со средней кривой того же района по прошлым годам сдвигом по времени '
+        f'(до ±{PHASE_SHIFT} дней, по максимуму корреляции — она не зависит от масштаба), и '
+        f'докладываются порознь сдвиг в днях «фаза_сдвиг» (положительный — развитие '
+        f'запаздывает), отношение амплитуд «фаза_ампл» и остаток формы после совмещения '
+        f'«фаза_форма».')
 
     m = folds[folds['схема'] == 'год']
     md = folds[folds['схема'] == 'районы']
@@ -552,6 +761,10 @@ def _docx(outdir, title, meta, folds, cand, cand_sh, imgs):
         'другому правилу: по способности упорядочить районы ВНУТРИ обучающих лет. Фолды те '
         'же — отложенный год, — меняется только критерий отбора (столбец r_обуч здесь и есть '
         'внутригодовая корреляция по обучающим годам).')
+    doc.add_paragraph(
+        'Эту таблицу нельзя читать отдельно от следующей. Здесь в каждом году берётся ОДИН '
+        'лучший признак, и на четырёх сотнях кандидатов такой отбор сам становится главным '
+        'источником ошибки: в следующем разделе та же схема с суммой трёх даёт вдвое больше.')
     E._table_from_df(doc, mi[cols], maxrows=40)
     pick = mi['лучший_признак'].value_counts()
     doc.add_paragraph(
@@ -562,6 +775,32 @@ def _docx(outdir, title, meta, folds, cand, cand_sh, imgs):
         f'{mi["ΔRMSE_внутр"].mean():+.3f} {meta["unit"]}, то есть '
         f'{100 * mi["ΔRMSE_внутр"].mean() / meta["rmse_line"]:+.1f} % от ошибки линии: '
         'корреляция звучит заметно лучше, чем стоит в единицах цели.')
+
+    doc.add_heading('Отбор одного признака против суммы трёх', level=1)
+    doc.add_paragraph(
+        'Отбор лучшего одного среди сотен кандидатов шумен сам по себе. Критерий отбора '
+        'оценивается по тем же десяти годам, и среди четырёх сотен кандидатов всегда '
+        'найдётся случайно удачный на обучении — он и вытеснит верный. Поэтому рядом '
+        f'считается сумма {SUM_K} лучших с РАВНЫМИ весами: она не подгоняет ни одного '
+        'коэффициента. Довод не только теоретический — удачи признаков по годам '
+        'отрицательно коррелируют: в годы, когда весенний интеграл проваливается, сдвиг '
+        'фазы как раз работает, и наоборот.')
+    E._table_from_df(doc, mi[COMP_COLS], maxrows=40)
+    doc.add_paragraph(
+        f'Среднее по отложенным годам: лучший один '
+        f'{mi["r_внутри_тест"].mean():+.3f}, сумма {SUM_K} '
+        f'{mi[f"r_внутри_сум{SUM_K}"].mean():+.3f}, объявленная тройка '
+        f'{mi["r_внутри_тройка"].mean():+.3f}; в {meta["unit"]} — '
+        f'{mi["ΔRMSE_внутр"].mean():+.3f}, {mi[f"ΔRMSE_сум{SUM_K}"].mean():+.3f} и '
+        f'{mi["ΔRMSE_тройка"].mean():+.3f} при ошибке линии {meta["rmse_line"]:.2f}.')
+    doc.add_paragraph(
+        'Столбец «тройка» надо читать с оговоркой, и она существенная. Это объявленная '
+        f'заранее тройка сводок кривой NDVI — {", ".join(TRIPLE)}, то есть «сколько», '
+        '«когда» и «как быстро падает», — но выбрана она была уже после того, как перебор '
+        'прошёл по всем годам. Поэтому её число — не честная оценка, а верхняя граница: '
+        'столько даёт знание, какие три сводки брать. Разница между столбцами «сумма» и '
+        '«тройка» и есть цена незнания. Проверить тройку можно только там, где она не '
+        'подбиралась, — на других культурах.')
 
     doc.add_heading('Планка: контроль перестановкой', level=1)
     doc.add_paragraph(
@@ -581,12 +820,43 @@ def _docx(outdir, title, meta, folds, cand, cand_sh, imgs):
          'признаков с |r| > 0.1': int((cand_sh[cand_sh['покрытие']]['|r_тест|'] > 0.1).sum())}])
     E._table_from_df(doc, cmp_t)
 
+    doc.add_heading('Норма района: вся история, прошлые годы, фаза', level=1)
+    doc.add_paragraph(
+        'Три семьи кандидатов сравниваются на одном переборе и с одной планкой. «вся_история» '
+        '— нормировка внутри района по всем годам; «норма_прошлых» — отклонение от нормы по '
+        f'последним {meta["norm"]} прошлым годам; «фаза» — сдвиг, амплитуда и остаток формы '
+        'кривой NDVI. Планка в последнем столбце считается по той же семье на перемешанном '
+        'остатке: у разных семей разное число кандидатов, а значит и разный шанс случайной '
+        'находки.')
+    fam = []
+    for nm, sub in cand[cand['покрытие']].groupby('семья'):
+        sh = cand_sh[cand_sh['покрытие'] & (cand_sh['семья'] == nm)]
+        fam.append({'семья': nm, 'кандидатов': len(sub),
+                    'лучшая |r_тест|': round(float(sub['|r_тест|'].max()), 4),
+                    'лучшая |r_внутри_года|': round(float(sub['r_внутри_года'].abs().max()), 4),
+                    'планка на шуме': (round(float(sh['|r_тест|'].max()), 4)
+                                       if len(sh) else np.nan)})
+    fam = pd.DataFrame(fam).sort_values('лучшая |r_внутри_года|', ascending=False)
+    E._table_from_df(doc, fam)
+    bst = fam.iloc[0]
+    doc.add_paragraph(
+        f'Лучшая внутригодовая корреляция у семьи «{bst["семья"]}» '
+        f'({bst["лучшая |r_внутри_года|"]:.3f} при планке {bst["планка на шуме"]:.3f}). '
+        'Сравнение семей между собой и есть ответ на вопрос, стоит ли подавать модели '
+        'разность «текущий год минус историческая кривая» вместо самого значения.')
+    top_ph = cand[cand['покрытие'] & (cand['семья'] == 'фаза')]
+    if not top_ph.empty:
+        doc.add_paragraph('Признаки фазы по отдельности:')
+        E._table_from_df(doc, top_ph[['признак', 'r_пул', 'r_тест_сред', 'r_внутри_года']],
+                         maxrows=6)
+
     doc.add_heading('20 лучших кандидатов по честной корреляции', level=1)
     doc.add_paragraph(
         'Ранжирование по корреляции на отложенных годах — без отбора, поэтому его можно '
         'читать как список подозреваемых, а не как подтверждённый результат.')
     E._table_from_df(doc, cand[cand['покрытие']].head(20)[
-        ['признак', 'r_пул', 'r_обуч_сред', 'r_тест_сред', 'r_внутри_года']], maxrows=20)
+        ['признак', 'семья', 'r_пул', 'r_обуч_сред', 'r_тест_сред', 'r_внутри_года']],
+        maxrows=20)
     doc.add_paragraph(
         'Столбцы стоит читать вместе. «r_пул» — корреляция по всем строкам сразу; '
         '«r_обуч_сред» и «r_тест_сред» — она же на обучающих и на отложенных годах; '
@@ -600,8 +870,8 @@ def _docx(outdir, title, meta, folds, cand, cand_sh, imgs):
     top_in = full.reindex(full['r_внутри_года'].abs().sort_values(ascending=False).index)
     best_in = top_in.iloc[0]
     ndvi_top = int(top_in.head(5)['признак'].str.contains('ndvi').sum())
-    hold = float(mi['r_внутри_тест'].mean())
-    plus = int((mi['r_внутри_тест'] > 0).sum())
+    hold = float(mi[f'r_внутри_сум{SUM_K}'].mean())
+    plus = int((mi[f'r_внутри_сум{SUM_K}'] > 0).sum())
     # находкой считаем только то, что подтвердилось на отложенных годах и с запасом над планкой
     conf = hold > max(2 * floor, 0.05) and plus >= 0.6 * len(mi)
     found = (
@@ -609,9 +879,11 @@ def _docx(outdir, title, meta, folds, cand, cand_sh, imgs):
         f'Лучший кандидат по внутригодовой корреляции — «{best_in["признак"]}» '
         f'({best_in["r_внутри_года"]:+.3f}); среди пяти лучших таких признаков '
         f'{ndvi_top} из 5 сняты с того же ряда NDVI, из которого мы брали один только '
-        f'максимум. На отложенных годах держится {hold:+.3f}, плюс в {plus} годах из '
-        f'{len(mi)}, планка перестановкой {floor:.3f} — это находка, а не шум. Пик '
-        f'выбрасывает всю форму кривой, и именно форма несёт то, чего пик не увидел.')
+        f'максимум. Сумма {SUM_K} с равными весами держит на отложенных годах {hold:+.3f}, '
+        f'плюс в {plus} годах из {len(mi)}, планка перестановкой {floor:.3f} — это находка, '
+        f'а не шум. Пик выбрасывает всю форму кривой, и именно форма несёт то, чего пик не '
+        f'увидел: сколько биомассы набрано весной, насколько развитие опережает норму '
+        f'района и как быстро съёмка падает после пика.')
     nofound = (
         f'Для этой культуры находки нет. Лучший кандидат по внутригодовой корреляции — '
         f'«{best_in["признак"]}» ({best_in["r_внутри_года"]:+.3f}) при планке перестановкой '
@@ -629,10 +901,10 @@ def _docx(outdir, title, meta, folds, cand, cand_sh, imgs):
         f'районы в этом году хуже прочих. Любой отбор по пулинговой корреляции выберет '
         f'именно их и проиграет: отбирать надо по внутригодовой.',
         f'Но и найденное надо мерить в центнерах. Внутригодовая корреляция '
-        f'{mi["r_внутри_тест"].mean():+.3f} на отложенных годах — это '
-        f'{mi["ΔRMSE_внутр"].mean():+.3f} {meta["unit"]} от ошибки линии '
+        f'{hold:+.3f} на отложенных годах — это '
+        f'{mi[f"ΔRMSE_сум{SUM_K}"].mean():+.3f} {meta["unit"]} от ошибки линии '
         f'{meta["rmse_line"]:.2f}, около '
-        f'{abs(100 * mi["ΔRMSE_внутр"].mean() / meta["rmse_line"]):.0f} %. Ранговая '
+        f'{abs(100 * mi[f"ΔRMSE_сум{SUM_K}"].mean() / meta["rmse_line"]):.0f} %. Ранговая '
         f'корреляция 0.2 отвечает примерно R² = 0.04, поэтому выигрыш и не может быть '
         + ('большим. Это полезная добавка, а не перелом.' if conf else
            'большим — а здесь он и вовсе отрицательный, то есть поправку ставить не на чем.'),
@@ -644,6 +916,12 @@ def _docx(outdir, title, meta, folds, cand, cand_sh, imgs):
         'Отсюда рабочий вывод: вторую переменную к пику искать не стоит, стоит лучше '
         'использовать сам ряд NDVI, а поправку держать общей для страны и небольшой. '
         'Районную калибровку поправки 10 лет не выдержат.',
+        'И вывод про сам перебор, обошедшийся дороже всего: расширение списка кандидатов '
+        'ухудшило честный результат. Пока кандидатов было две сотни, отбор лучшего одного '
+        'давал 0.19 на отложенных годах; на четырёх сотнях он даёт вдвое меньше, хотя сами '
+        'данные не изменились и среди них появился настоящий новый признак. Лечится это не '
+        'умным критерием отбора (проверено: отбор по устойчивости к годам ещё хуже), а '
+        'отказом от отбора — суммой нескольких признаков с равными весами.',
         'И вывод про сам опыт: его стоит прогонять по каждой культуре отдельно. Находка на '
         'одной культуре не переносится автоматически — у озимых весенний ряд NDVI говорит о '
         'перезимовке, которой у яровых просто нет, и там тот же признак оказывается почти '
@@ -669,6 +947,7 @@ def _docx(outdir, title, meta, folds, cand, cand_sh, imgs):
 
     doc.add_heading('Выгрузки', level=1)
     for s in ('candidates.csv — все кандидаты с корреляциями на обучении и на тесте;',
+              'phase.csv — сдвиг, амплитуда и остаток формы кривой NDVI (кэш);',
               'candidates_shuffled.csv — то же на перемешанном остатке (планка);',
               'folds.csv — по фолдам: выбранный признак и ΔRMSE;',
               'residuals.csv — остаток районной линии по району и году;',
@@ -687,15 +966,17 @@ def _docx(outdir, title, meta, folds, cand, cand_sh, imgs):
 
 
 # --------------------------------------------------------------------------- #
-def run(culture, target, min_years, form, rebuild):
+def run(culture, target, min_years, form, rebuild, norm_years=NORM_YEARS):
     cu = P.culture_row(culture)
     hdoy, task = P.harvest_doy(cu['culture_id'])
     title = str(cu['title'])
     outdir = os.path.join(config.REPORTS_DIR, 'peak_residual', task)
     os.makedirs(outdir, exist_ok=True)
     fcache = os.path.join(outdir, 'features.csv')
-    if rebuild and os.path.exists(fcache):
-        os.remove(fcache)
+    pcache_f = os.path.join(outdir, 'phase.csv')
+    for c in (fcache, pcache_f):
+        if rebuild and os.path.exists(c):
+            os.remove(c)
 
     d, _diag = P.targets_table(cu['bdpmo_culture'])
     fert = fertilizer(cu['bdpmo_culture'])
@@ -718,9 +999,19 @@ def run(culture, target, min_years, form, rebuild):
     mask_parm = str(d['маска'].mode().iloc[0])
     f = features_table(rl, mask_parm, hdoy, fcache)
     rl = rl.merge(f, on=['territory_id', 'year'], how='left')
+    ph = phase_table(rl, mask_parm, hdoy, pcache_f, norm_years)
+    rl = rl.merge(ph, on=['territory_id', 'year'], how='left')
 
-    names = [c for c in rl.columns if '|' in c] + [c for c in BDPMO_FEATS if c in rl.columns]
+    base = [c for c in rl.columns if '|' in c]
+    names = base + [c for c in BDPMO_FEATS if c in rl.columns]
     X = rl[names].to_numpy(float)
+    # вторая семья: те же величины, но как отклонение от нормы района по прошлым годам.
+    # Признаки фазы уже построены как отклонение от такой нормы, их повторно не трогаем.
+    anom = [c for c in base if 'фаза' not in c]
+    A = _past_anomaly(rl[anom].to_numpy(float), rl['territory_id'].to_numpy(),
+                      rl['year'].to_numpy(int), norm_years)
+    X = np.hstack([X, A])
+    names = names + [f'{c}@норма{norm_years}' for c in anom]
     keep = np.isfinite(X).sum(axis=0) >= MIN_PAIRS      # кандидаты без покрытия не нужны
     X, names = X[:, keep], [n for n, k in zip(names, keep) if k]
     rmse_line = float(np.sqrt(np.mean(rl['ост'].to_numpy(float) ** 2)))
@@ -747,6 +1038,9 @@ def run(culture, target, min_years, form, rebuild):
     print(g.groupby('схема')[['|r_обуч|', '|r_тест|', '|r_внутри_тест|', 'r_внутри_тест',
                               'ΔRMSE_внутр', 'ΔRMSE_один', f'ΔRMSE_топ{TOP_K}']]
           .mean().round(3).to_string())
+    print('\n=== отбор одного против суммы (схема год_внутри)')
+    print(folds[folds['схема'] == 'год_внутри'][COMP_COLS].to_string(index=False))
+    print(folds[folds['схема'] == 'год_внутри'][COMP_COLS[1:]].mean().round(4).to_string())
     fl = cand_sh[cand_sh['покрытие']]['|r_тест|'].max()
     print(f'планка перестановкой: лучшая |r| на шуме {fl:.4f}, на данных '
           f'{cands[cands["покрытие"]]["|r_тест|"].max():.4f}')
@@ -763,7 +1057,7 @@ def run(culture, target, min_years, form, rebuild):
     meta = {'target': target, 'unit': P.UNITS[target], 'mask': mask_parm,
             'districts': int(rl['territory_id'].nunique()), 'rows': len(rl),
             'year_min': int(rl['year'].min()), 'year_max': int(rl['year'].max()),
-            'n_cand': len(names), 'rmse_line': rmse_line,
+            'n_cand': len(names), 'rmse_line': rmse_line, 'norm': norm_years,
             'windows': list(windows(hdoy, 160))}
     imgs = _plots(outdir, cands, cand_sh, folds)
     _docx(outdir, title, meta, folds, cands, cand_sh, imgs)
@@ -777,6 +1071,8 @@ def main():
     ap.add_argument('--target', default='убранная', choices=P.TARGETS)
     ap.add_argument('--min-years', type=int, default=7)
     ap.add_argument('--form', default='линейная', choices=P.FORMS)
+    ap.add_argument('--norm-years', type=int, default=NORM_YEARS,
+                    help='сколько прошлых лет берёт норма района')
     ap.add_argument('--rebuild', action='store_true', help='пересчитать кэш признаков')
     a = ap.parse_args()
 
@@ -785,11 +1081,11 @@ def main():
         for name in cu['title'].astype(str):
             print(f'\n################ {name}')
             try:
-                run(name, a.target, a.min_years, a.form, a.rebuild)
+                run(name, a.target, a.min_years, a.form, a.rebuild, a.norm_years)
             except SystemExit as e:
                 print(f'пропуск: {e}')
         return
-    run(a.culture, a.target, a.min_years, a.form, a.rebuild)
+    run(a.culture, a.target, a.min_years, a.form, a.rebuild, a.norm_years)
 
 
 if __name__ == '__main__':
