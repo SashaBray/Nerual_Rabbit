@@ -84,7 +84,16 @@ def _third_comma(line):
     return line.find(_COMMA, i + 1)
 
 
-def _parse_block(raw):
+def _fmt_day(day, fractional=False):
+    """День в том же виде, в каком его писал pandas.to_csv.
+
+    Для 6-часовых рядов дробная часть номера дня — это и есть время внутри суток
+    (``1.25`` = 06:00), поэтому её нельзя терять при записи.
+    """
+    return f'{float(day):g}' if fractional else str(int(day))
+
+
+def _parse_block(raw, fractional=False):
     """Разобрать байты блока строк оверлея в ``[[day, value], ...]`` по возрастанию дня."""
     out = []
     for line in raw.split(b'\n'):
@@ -99,10 +108,13 @@ def _parse_block(raw):
             continue
         day = line[i4 + 1:i5]
         value = line[i5 + 1:].rstrip()          # rstrip убирает '\r' при CRLF
-        try:
-            day = int(day)
-        except ValueError:
-            day = int(float(day))
+        if fractional:
+            day = float(day)
+        else:
+            try:
+                day = int(day)
+            except ValueError:
+                day = int(float(day))
         out.append([day, float(value) if value else float('nan')])
     out.sort(key=itemgetter(0))                 # Timsort устойчив: порядок внутри дня сохраняется
     return out
@@ -121,8 +133,12 @@ class OverlayIndex(Mapping):
     к нему, к индексу и к кэшу идут под одним реентерабельным замком.
     """
 
-    def __init__(self, csv_path, cache_points=_CACHE_POINTS, verbose=True):
+    def __init__(self, csv_path, cache_points=_CACHE_POINTS, verbose=True,
+                 fractional_days=False):
         self.csv_path = csv_path
+        # 6-часовое хранилище держит время внутри суток в дробной части номера дня;
+        # суточный оверлей — целые дни, и для него поведение остаётся прежним
+        self.fractional_days = bool(fractional_days)
         self.index_path, self.meta_path = index_paths(csv_path)
         self.cache_points = int(cache_points)
         self.verbose = verbose
@@ -172,7 +188,7 @@ class OverlayIndex(Mapping):
             fh = self._reader()
             fh.seek(offset)
             raw = fh.read(nbytes)
-        pts = _parse_block(raw)                 # разбор — вне замка
+        pts = _parse_block(raw, self.fractional_days)       # разбор — вне замка
         with self._lock:
             self._cache_put(key, pts)
         return pts
@@ -202,7 +218,8 @@ class OverlayIndex(Mapping):
         tid, parm, year = str(key[0]), str(key[1]), int(key[2])
         uid_txt = '' if vega_uid is None or vega_uid == '' else str(int(vega_uid))
         prefix = f'{tid},{parm},{year},{uid_txt},'
-        raw = ''.join(f'{prefix}{int(d)},{_fmt_value(v)}{EOL}' for d, v in points).encode('utf-8')
+        raw = ''.join(f'{prefix}{_fmt_day(d, self.fractional_days)},{_fmt_value(v)}{EOL}'
+                      for d, v in points).encode('utf-8')
         uid = None if uid_txt == '' else int(uid_txt)
 
         with self._lock:
@@ -217,7 +234,8 @@ class OverlayIndex(Mapping):
 
             entries[key] = (offset, len(raw), len(points), uid)
             self._covered = offset + len(raw)
-            self._cache_put(key, [[int(d), float(v)] for d, v in points])
+            cast = float if self.fractional_days else (lambda x: int(float(x)))
+            self._cache_put(key, [[cast(d), float(v)] for d, v in points])
             self._append_index_rows([(key, entries[key])])
             self._write_meta()
 
