@@ -973,11 +973,17 @@ def _docx(outdir, title, meta, folds, cand, cand_sh, imgs):
 
 
 # --------------------------------------------------------------------------- #
-def run(culture, target, min_years, form, rebuild, norm_years=NORM_YEARS):
+def run(culture, target, min_years, form, rebuild, norm_years=NORM_YEARS,
+        early=False):
+    if early and target != "убранная":
+        raise SystemExit("ранние годы есть только у цели «убранная»")
     cu = P.culture_row(culture)
     hdoy, task = P.harvest_doy(cu['culture_id'])
     title = str(cu['title'])
-    outdir = os.path.join(config.REPORTS_DIR, 'peak_residual', task)
+    # свой каталог: кэши пика, признаков и фазы ключом не помечены, и прогон на 11
+    # годах иначе прочитал бы кэш от 18 лет
+    sub = task + ('_early' if early else '')
+    outdir = os.path.join(config.REPORTS_DIR, 'peak_residual', sub)
     os.makedirs(outdir, exist_ok=True)
     fcache = os.path.join(outdir, 'features.csv')
     pcache_f = os.path.join(outdir, 'phase.csv')
@@ -985,13 +991,13 @@ def run(culture, target, min_years, form, rebuild, norm_years=NORM_YEARS):
         if rebuild and os.path.exists(c):
             os.remove(c)
 
-    d, _diag = P.targets_table(cu['bdpmo_culture'])
+    d, _diag = P.targets_table(cu['bdpmo_culture'], early=early)
     fert = fertilizer(cu['bdpmo_culture'])
     if fert is not None:
         d = d.merge(fert, on=['territory_id', 'year'], how='left')
         d['удобр_га'] = d['удобрения'] / d['посевная'].replace(0, np.nan)
 
-    pcache = os.path.join(config.REPORTS_DIR, 'peak_regression', task, 'peaks.csv')
+    pcache = os.path.join(config.REPORTS_DIR, 'peak_regression', sub, 'peaks.csv')
     os.makedirs(os.path.dirname(pcache), exist_ok=True)
     pk = P.peaks_table(sorted(d['territory_id'].unique()), sorted(d['year'].unique()),
                        cu['mask_culture'], hdoy, pcache)
@@ -1081,6 +1087,8 @@ def main():
     ap.add_argument('--norm-years', type=int, default=NORM_YEARS,
                     help='сколько прошлых лет берёт норма района')
     ap.add_argument('--rebuild', action='store_true', help='пересчитать кэш признаков')
+    ap.add_argument('--early', action='store_true',
+                    help='взять 2007-2013: цель из yields, отчёт в <задание>_early')
     a = ap.parse_args()
 
     if str(a.culture).strip().lower() == 'all':
@@ -1088,11 +1096,12 @@ def main():
         for name in cu['title'].astype(str):
             print(f'\n################ {name}')
             try:
-                run(name, a.target, a.min_years, a.form, a.rebuild, a.norm_years)
+                run(name, a.target, a.min_years, a.form, a.rebuild, a.norm_years,
+                    a.early)
             except SystemExit as e:
                 print(f'пропуск: {e}')
         return
-    run(a.culture, a.target, a.min_years, a.form, a.rebuild, a.norm_years)
+    run(a.culture, a.target, a.min_years, a.form, a.rebuild, a.norm_years, a.early)
 
 
 if __name__ == '__main__':
